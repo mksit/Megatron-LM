@@ -130,6 +130,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.mask_func = mask_func
         self.softmax_in_fp32 = softmax_in_fp32
         self.scale = scale
+        self.torch_softmax = torch.nn.Softmax(dim=-1)
 
         assert self.scale is None or softmax_in_fp32, "softmax should be in fp32 when scaled"
 
@@ -203,7 +204,8 @@ class FusedScaleMaskSoftmax(nn.Module):
             mask = get_default_causal_mask(sq)
 
         mask_output = self.mask_func(input, mask) if mask is not None else input
-        probs = torch.nn.Softmax(dim=-1)(mask_output)
+        # probs = torch.nn.Softmax(dim=-1)(mask_output)
+        probs = self.torch_softmax(mask_output)
 
         if self.input_in_float16 and self.softmax_in_fp32:
             if self.input_in_fp16:
