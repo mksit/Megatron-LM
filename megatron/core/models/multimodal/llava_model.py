@@ -76,6 +76,7 @@ class LLaVAModel(MegatronModule):
         img_w: int = 336,
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
+        language_rope_scaling: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -112,6 +113,7 @@ class LLaVAModel(MegatronModule):
                 pre_process=self.pre_process,
                 post_process=self.post_process,
                 rotary_base=language_rotary_base,
+                rope_scaling=language_rope_scaling,
             )
             self.share_embeddings_and_output_weights = (
                 self.language_model.share_embeddings_and_output_weights
@@ -351,7 +353,9 @@ class LLaVAModel(MegatronModule):
             ]
 
             # Put image embeddings to image positions.
-            final_embedding[images_mask] = image_embeddings.reshape(-1, embed_dim).contiguous()
+            final_embedding[images_mask] = (
+                image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+            )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None
@@ -429,6 +433,7 @@ class LLaVAModel(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         num_image_tiles: Optional[List[int]] = None,
         image_token_index: Optional[int] = IMAGE_TOKEN_INDEX,
+        runtime_gather_output: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
@@ -445,6 +450,8 @@ class LLaVAModel(MegatronModule):
             inference_params (InferenceParams): Inference-time parameters including KV cache.
             num_image_tiles (list of int): Number of tiles per image. Default 1 tile per image.
             image_token_index (int): ID for input images.
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
 
         Returns:
             output (torch.Tensor): Loss of shape [b, s] if labels are provided,
@@ -463,7 +470,9 @@ class LLaVAModel(MegatronModule):
             image_embeddings = None
         elif self.add_encoder and not has_images:
             # If no images provided, use an empty image embeddings tensor.
-            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device)
+            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device).reshape(
+                0, 0, 0
+            )
         elif self.add_encoder and has_images:
             image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
             if self._drop_vision_class_token:
@@ -528,6 +537,7 @@ class LLaVAModel(MegatronModule):
             decoder_input=combined_embeddings,
             labels=new_labels,
             inference_params=inference_params,
+            runtime_gather_output=runtime_gather_output,
         )
 
         if labels is None or loss_mask is None:
