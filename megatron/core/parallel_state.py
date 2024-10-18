@@ -1645,3 +1645,13 @@ def destroy_model_parallel():
 
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     _MOE_LAYER_WISE_LOGGING_TRACKER = {}
+
+
+# NOTE(mksit): modified for DeepSpeed
+
+def get_model_parallel_world_size():
+    return get_tensor_model_parallel_world_size()
+
+
+def get_model_parallel_rank():
+    return get_tensor_model_parallel_rank()

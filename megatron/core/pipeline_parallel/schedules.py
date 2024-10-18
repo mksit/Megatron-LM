@@ -326,7 +326,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model=None):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -357,13 +357,16 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         output_tensor_grad = [output_tensor_grad]
 
     # Backward pass.
-    if output_tensor_grad[0] is None and config.grad_scale_func is not None:
-        output_tensor[0] = config.grad_scale_func(output_tensor[0])
+    # if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+    #     output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
-    if config.deallocate_pipeline_outputs:
-        custom_backward(output_tensor[0], output_tensor_grad[0])
-    else:
-        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+    # if config.deallocate_pipeline_outputs:
+    #     custom_backward(output_tensor[0], output_tensor_grad[0])
+    # else:
+    #     torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+
+    # NOTE(mksit): modified for DeepSpeed
+    model.backward(output_tensor[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -461,7 +464,7 @@ def forward_backward_no_pipelining(
             )
             total_num_tokens += num_tokens.item()
             if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model=model)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
@@ -482,7 +485,7 @@ def forward_backward_no_pipelining(
     total_num_tokens += num_tokens.item()
 
     if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model=model)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for

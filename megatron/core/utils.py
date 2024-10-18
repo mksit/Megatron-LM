@@ -110,7 +110,9 @@ def get_model_xattn(model):
 
 def get_model_config(model):
     """Returns the config attribute, allowed to return None"""
-    return get_attr_wrapped_model(model, 'config', allow_none=False)
+    # return get_attr_wrapped_model(model, 'config', allow_none=False)
+    # NOTE(mksit): modified for DeepSpeed
+    return get_attr_wrapped_model(model.module, 'config', allow_none=False)
 
 
 class GlobalMemoryBuffer:
