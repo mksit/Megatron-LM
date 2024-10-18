@@ -41,6 +41,7 @@ def register_pipeline_terminator(pipeline: jetclient.JETPipeline):
 
 def launch_and_wait_for_completion(
     test_case: str,
+    environment: str,
     container_image: str,
     container_tag: str,
     cluster: str,
@@ -52,7 +53,10 @@ def launch_and_wait_for_completion(
         customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
     ).workloads.submit(
         workloads=common.load_workloads(
-            test_case=test_case, container_image=container_image, container_tag=container_tag
+            test_case=test_case,
+            container_image=container_image,
+            container_tag=container_tag,
+            environment=environment,
         ),
         config_id=resolve_cluster_config(cluster),
         custom_config={
@@ -86,6 +90,22 @@ def launch_and_wait_for_completion(
     return pipeline
 
 
+def download_job_assets(job: jetclient.JETJob, iteration: int = 0) -> List[str]:
+    logs = job.get_logs()
+    if not logs:
+        return [""]
+
+    assets_base_path = BASE_PATH / ".." / ".." / ".." / ".." / "results" / f"iteration={iteration}"
+
+    for restart_idx, log in enumerate(logs):
+        assets = log.get_assets()
+        assets_path = assets_base_path / f"restart={restart_idx}"
+        assets_path.mkdir(parents=True, exist_ok=True)
+        for log_filename in assets.keys():
+            with open(assets_path / log_filename, "w") as fh:
+                assets[log_filename].download(pathlib.Path(fh.name))
+
+
 def download_job_logs(job: jetclient.JETJob) -> List[str]:
     logs = job.get_logs()
     if not logs:
@@ -111,6 +131,9 @@ def parse_iterations_from_logs(logs: List[str]) -> Optional[Tuple[int, int]]:
 @click.option("--model", required=True, type=str, help="Model")
 @click.option("--test-case", required=True, type=str, help="Test case")
 @click.option(
+    "--environment", required=True, type=click.Choice(['dev', 'lts']), help="Pytorch LTS or DEV"
+)
+@click.option(
     "--account",
     required=False,
     type=str,
@@ -132,6 +155,7 @@ def parse_iterations_from_logs(logs: List[str]) -> Optional[Tuple[int, int]]:
 def main(
     model: str,
     test_case: str,
+    environment: str,
     account: str,
     cluster: str,
     container_tag: str,
@@ -157,9 +181,11 @@ def main(
         sys.exit(1)
 
     n_attempts = 0
+    n_iteration = 0
     while True and n_attempts < 3:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
+            environment=environment,
             container_image=container_image,
             container_tag=container_tag,
             cluster=cluster,
@@ -168,11 +194,13 @@ def main(
             wandb_experiment=wandb_experiment,
         )
 
-        logs = download_job_logs(
-            job=[job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
-        )
+        main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
+
+        logs = download_job_logs(job=main_job)
         concat_logs = "\n".join(logs)
         print(f"Logs:\n{concat_logs}")
+
+        download_job_assets(job=main_job, iteration=n_iteration)
 
         if test_type != "release":
             success = pipeline.get_status() == PipelineStatus.SUCCESS
@@ -186,9 +214,10 @@ def main(
 
         current_iteration, total_iterations = parsed_result
         if current_iteration == total_iterations:
+
             success = pipeline.get_status() == PipelineStatus.SUCCESS
             sys.exit(int(not success))  # invert for exit 0
-
+        n_iteration += 1
     sys.exit(1)
 
 
