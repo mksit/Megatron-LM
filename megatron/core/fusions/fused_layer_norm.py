@@ -20,7 +20,16 @@ except ImportError:
     HAVE_PERSIST_LAYER_NORM = False
 
 try:
-    from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
+    import compactron
+    COMPACTRON_INSTALLED = True
+except ImportError:
+    COMPACTRON_INSTALLED = False
+
+try:
+    if COMPACTRON_INSTALLED:
+        from compactron.custom_ops import FusedLayerNormAffineFunction
+    else:
+        from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
 
     HAVE_FUSED_LAYER_NORM = True
 except ImportError:
