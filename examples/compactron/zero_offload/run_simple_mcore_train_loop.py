@@ -4,6 +4,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from functools import partial
 from pathlib import Path
+import logging
 
 from megatron.core import parallel_state
 from megatron.core import dist_checkpointing
@@ -46,6 +47,7 @@ ds_config_dict = {
         "offload_optimizer": {
             "device": "cpu",
             "pin_memory": True,
+            "ratio": 0.5,
         }
     }
 }
@@ -77,7 +79,7 @@ def model_provider():
     )
 
     with deepspeed.zero.Init(
-        config=ds_config_dict,
+        config_dict_or_path=ds_config_dict,
         data_parallel_group=mpu.get_data_parallel_group(),
         pin_memory=True,
         mpu=mpu,
@@ -153,7 +155,15 @@ def load_distributed_checkpoint(checkpoint_path, gpt_model):
     return gpt_model
 
 if __name__ == "__main__":
-    initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    tensor_model_parallel_size = 1
+    pipeline_model_parallel_size = 1
+
+    # Otherwise it will throw an error
+    if tensor_model_parallel_size == 1:
+        from megatron.core.datasets.gpt_dataset import MockGPTLowLevelDataset
+        MockGPTLowLevelDataset.max_sequence_length = _SEQUENCE_LENGTH
+
+    initialize_distributed(tensor_model_parallel_size=tensor_model_parallel_size, pipeline_model_parallel_size=pipeline_model_parallel_size)
     model_parallel_cuda_manual_seed(123)
 
     gpt_model = model_provider()
