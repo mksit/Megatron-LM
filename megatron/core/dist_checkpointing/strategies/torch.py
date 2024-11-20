@@ -13,9 +13,9 @@ import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
-from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
-from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
-from torch.distributed._tensor import DTensor
+from torch.distributed._shard.sharded_tensor import Shard
+from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata, TensorProperties
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
     DefaultLoadPlanner,
@@ -33,6 +33,7 @@ from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
+from ...utils import get_torch_version
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
 from ..mapping import (
@@ -68,6 +69,13 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+try:
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
 
 
 def register_default_torch_strategies():
@@ -450,7 +458,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
         # during saving.
-        if PkgVersion(torch.__version__) <= PkgVersion("2.2"):
+        if get_torch_version() <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}
@@ -465,7 +473,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         # add those requests on all ranks. We inline a simplified version of this method below.
         write_items = []
         for fqn, obj in self.state_dict.items():
-            assert not isinstance(
+            assert not HAVE_DTENSOR or not isinstance(
                 obj, DTensor
             )  # translation from MCore ShardedTensors shouldn't result in DTensors
             # Create write requests for tensor and bytes values.
@@ -510,6 +518,11 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
+            if sh_ten.key not in metadata.state_dict_metadata:
+                raise KeyError(
+                    f"{sh_ten.key} from model not in state dict:"
+                    f" {sorted(metadata.state_dict_metadata.keys())}"
+                )
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
             if not is_nd_flattened_tensor(sh_ten):
                 expected_shape = sh_ten.global_shape
