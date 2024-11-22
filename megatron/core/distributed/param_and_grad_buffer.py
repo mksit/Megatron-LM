@@ -12,6 +12,13 @@ from torch.distributed import _coalescing_manager
 from ..utils import is_float8tensor, is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
+try:
+    from compactron.runtime.offload_buffers import OffloadParameter
+    HAS_COMPACTRON = True
+except ImportError:
+    HAS_COMPACTRON = False
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -286,6 +293,12 @@ class _ParamAndGradBucketGroup:
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
             self.grad_reduce_handle = None
+
+        # Offloads the gradients of offloaded parameters to host memory if using Compactron.
+        if HAS_COMPACTRON:
+            for param in self.params:
+                if isinstance(param, OffloadParameter):
+                    param.offload_gradients()
 
     def finish_grad_sync(self):
         """
