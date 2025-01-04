@@ -141,10 +141,6 @@ class FusedLayerNorm(torch.nn.Module):
 
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
 
-        if torch._guards.active_fake_mode() is not None:
-            import torch.nn.functional as F
-            return F.layer_norm(input, self.hidden_size, weight, self.bias, self.eps)
-
         if self.persist_layer_norm:
             if 'memory_efficient' in inspect.getfullargspec(FastLayerNormFN.forward).args:
                 output = FastLayerNormFN.apply(
