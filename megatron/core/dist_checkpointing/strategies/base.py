@@ -28,9 +28,10 @@ async_calls = AsyncCallsQueue()
 
 def get_default_strategy(action: StrategyAction, backend: str, version: int):
     """Retrieves a default strategy for a given action, backend and version."""
+    error_hint: str = None
     try:
         if backend == 'zarr':
-            error_hint = ' Please install `zarr` and `tensorstore<=0.1.45` packages'
+            error_hint = ' Please install `zarr` and `tensorstore!=0.1.46` packages'
             from .tensorstore import register_default_tensorstore_strategies
 
             register_default_tensorstore_strategies()
@@ -168,6 +169,10 @@ class LoadShardedStrategy(LoadStrategyBase):
         raise NotImplementedError(
             f'Loading only sharded metadata not implemented for {self.__class__.__name__}'
         )
+
+    def remove_sharded_tensors(self, checkpoint_dir: str, key_prefix: str):
+        """Remove all tensors whose key starts with key_prefix"""
+        raise NotImplementedError
 
 
 class SaveCommonStrategy(SaveStrategyBase):

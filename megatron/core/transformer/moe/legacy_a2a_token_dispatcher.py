@@ -1,12 +1,14 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+# type: ignore
+# This file will be deprecated soon. We won't fix the mypy type checks.
+
 from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.tensor_parallel.mappings import _gather_along_first_dim_expert_parallel
 from megatron.core.transformer.moe.moe_utils import (
     get_capacity,
     permute,
@@ -61,13 +63,13 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         self.num_global_tokens_per_local_expert_cpu = None
         input_chunk_idxs = torch.arange(self.num_experts)
         # [num_local_experts, ep_size]. Sort the input chunks by local experts.
-        self.sort_input_by_local_experts = (
-            input_chunk_idxs.reshape(-1, self.num_local_experts).T.ravel().tolist()
-        )
+        self.sort_input_by_local_experts = input_chunk_idxs.reshape(
+            -1, self.num_local_experts
+        ).T.ravel()
         # [ep_size, num_local_experts]. Restore the output chunks by local experts.
-        self.restore_output_by_local_experts = (
-            input_chunk_idxs.reshape(self.num_local_experts, -1).T.ravel().tolist()
-        )
+        self.restore_output_by_local_experts = input_chunk_idxs.reshape(
+            self.num_local_experts, -1
+        ).T.ravel()
 
         # Token drop and padding.
         # We need to keep track of the token num if we drop tokens without padding them.
@@ -150,8 +152,8 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
                 .to(torch.device("cpu"), non_blocking=True)
                 .numpy()
             )
-            num_global_tokens_per_expert = _gather_along_first_dim_expert_parallel(
-                num_local_tokens_per_expert
+            num_global_tokens_per_expert = tensor_parallel.gather_from_sequence_parallel_region(
+                num_local_tokens_per_expert, group=self.ep_group
             ).reshape(ep_size, self.num_experts)
             self.num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1

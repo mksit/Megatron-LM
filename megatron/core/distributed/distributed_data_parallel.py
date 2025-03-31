@@ -7,8 +7,10 @@ import torch
 
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+from ..fp8_utils import is_float8tensor
+from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import is_float8tensor, log_single_rank
+from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
@@ -151,12 +153,25 @@ class DistributedDataParallel(_BaseDataParallel):
                     with_context_parallel=True
                 )
                 if self.ddp_config.average_in_collective:
-                    # Collective is averaging gradients in collective with data_parallel_group.
-                    assert (
-                        gradient_scaling_factor
-                        / torch.distributed.get_world_size(group=data_parallel_group)
-                        == target_gradient_scaling_factor
-                    )
+                    if self.ddp_config.num_distributed_optimizer_instances == 1:
+                        # Collective is averaging gradients in collective with data_parallel_group.
+                        assert (
+                            gradient_scaling_factor
+                            / torch.distributed.get_world_size(group=data_parallel_group)
+                            == target_gradient_scaling_factor
+                        )
+                    else:
+                        # For non-expert parameters, gradient_scaling_factor is 1.
+                        # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
+                        assert (gradient_scaling_factor == 1) or (
+                            gradient_scaling_factor
+                            == (
+                                parallel_state.get_expert_data_parallel_world_size()
+                                / parallel_state.get_data_parallel_world_size(
+                                    with_context_parallel=True
+                                )
+                            )
+                        )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
 
@@ -188,6 +203,20 @@ class DistributedDataParallel(_BaseDataParallel):
             # bucket group.
             bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
 
+            if self.ddp_config.num_distributed_optimizer_instances > 1:
+                assert (
+                    parallel_state.get_expert_model_parallel_world_size() == 1
+                ), "Partial DistOpt cannot support MoE models with expert parallelism."
+                assert (
+                    self.ddp_config.use_distributed_optimizer
+                ), 'Partial DistOpt cannot be used without DistOpt'
+                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                for bucket_group in bucket_groups:
+                    bucket_group.inter_distributed_optimizer_instance_group = (
+                        parallel_state.get_inter_partial_data_parallel_group()
+                    )
+                    bucket_group.communication_stream = communication_stream
+
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
             if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
@@ -206,25 +235,52 @@ class DistributedDataParallel(_BaseDataParallel):
             return buffers, bucket_groups
 
         if config.calculate_per_token_loss:
+            assert (
+                not self.ddp_config.average_in_collective
+            ), "Cannot average in collective when calculating per-token loss!"
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
         else:
+            # The goal is to scale reduced gradients by 1/dp_size.
+            # This can be achieved in two ways:
+            #
+            # Case 1: average_in_collective=True
+            # - Non-expert parameters:
+            #   1. No pre-scaling (gradient_scaling_factor=1.0)
+            #   2. Do average reduction over dp group (equals to sum then divide by dp_size)
+            #   3. Final result is scaled by 1/dp_size as desired
+            #
+            # - Expert parameters:
+            #   1. Scale by edp_size/dp_size before reduction
+            #   2. Do average reduction over edp group (equals to sum then divide by edp_size)
+            #   3. Resulted scaling: (edp_size/dp_size) * (1/edp_size) = 1/dp_size as desired
+            #   (edp_size = expert data parallel world size)
+            #
+            # Case 2: average_in_collective=False
+            # - Both expert and non-expert parameters:
+            #   1. Scale gradients by 1/dp_size before reduction
+            #   2. Do sum reduction across data parallel ranks
+            #   3. Final result is scaled by 1/dp_size as desired
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = (
-                    1.0 / parallel_state.get_expert_model_parallel_world_size()
+                    parallel_state.get_expert_data_parallel_world_size()
+                    / parallel_state.get_data_parallel_world_size(with_context_parallel=True)
                 )
             else:
                 data_parallel_world_size = parallel_state.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
+
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params,
-            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            parallel_state.get_data_parallel_group(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
             gradient_scaling_factor=gradient_scaling_factor,
         )
 
@@ -232,7 +288,7 @@ class DistributedDataParallel(_BaseDataParallel):
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
                 expert_parallel_params,
-                parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
+                parallel_state.get_expert_data_parallel_group(),
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
@@ -283,9 +339,10 @@ class DistributedDataParallel(_BaseDataParallel):
                 self._make_forward_pre_hook()
             )
 
-    def disable_forward_pre_hook(self):
+    def disable_forward_pre_hook(self, param_sync: bool = True):
         """
         Disable forward pre-hooks needed for param all-gather overlap with forward compute.
+        Skip synchronous param all-gather if `param_sync` is False.
         """
         assert self.use_forward_hook
         # De-register forward pre-hook for all sub-modules.
@@ -296,7 +353,8 @@ class DistributedDataParallel(_BaseDataParallel):
         assert len(self.remove_forward_pre_hook_handles) == 0
 
         # Force synchronize parameters.
-        self.start_param_sync(force_sync=True)
+        if param_sync:
+            self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """
@@ -308,6 +366,9 @@ class DistributedDataParallel(_BaseDataParallel):
             assert (
                 self.use_forward_hook
             ), "Should use pre-hook only when overlap_param_gather is True"
+
+            if is_graph_capturing():
+                return
 
             # Make sure all parameters in this module have been all-gathered as necessary.
             for param in module.parameters(recurse=False):
@@ -339,6 +400,9 @@ class DistributedDataParallel(_BaseDataParallel):
         """
 
         def hook(*unused):
+            if is_graph_capturing():
+                return
+
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
@@ -425,8 +489,12 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
-        for param in self.params_with_grad:
-            param.grad_added_to_main_grad = False
+        if not self.config.external_cuda_graph:
+            # Don't reset grad_added_to_main_grad when CUDA Graph is used.
+            # Because in CUDA Graph it no longer has the opportunity to set it back
+            # to True, and there will be a double-GA.
+            for param in self.params_with_grad:
+                param.grad_added_to_main_grad = False
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.reset()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
@@ -440,12 +508,10 @@ class DistributedDataParallel(_BaseDataParallel):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group(
-                    with_context_parallel=True
-                )
+                data_parallel_group = parallel_state.get_expert_data_parallel_group()
             else:
                 data_parallel_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True
+                    with_context_parallel=True, partial_data_parallel=True
                 )
             torch.distributed.broadcast(
                 param.data,

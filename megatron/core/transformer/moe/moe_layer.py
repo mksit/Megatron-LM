@@ -7,17 +7,15 @@ from typing import Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import MoEAlltoAllSEQTokenDispatcher
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
+    MoEFlexTokenDispatcher,
 )
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -42,15 +40,11 @@ class BaseMoELayer(MegatronModule, ABC):
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
         assert self.expert_parallel_size > 0, "Expected non-negative expert parallel size"
 
-        if self.config.moe_extended_tp:
-            self.num_local_experts = self.config.num_moe_experts
-            local_expert_indices_offset = 0
-        else:
-            assert self.config.num_moe_experts % self.expert_parallel_size == 0
-            self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
-            local_expert_indices_offset = (
-                parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
-            )
+        assert self.config.num_moe_experts % self.expert_parallel_size == 0
+        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
+        local_expert_indices_offset = (
+            parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
+        )
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
@@ -84,7 +78,7 @@ class MoELayer(BaseMoELayer):
     """
 
     def __init__(
-        self, config: TransformerConfig, submodules: MLPSubmodules = None, layer_number: int = None
+        self, config: TransformerConfig, submodules: MoESubmodules = None, layer_number: int = None
     ):
         self.submodules = submodules
         super(MoELayer, self).__init__(config=config, layer_number=layer_number)
@@ -92,20 +86,6 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router
         self.router = TopKRouter(config=self.config)
-
-        # Initialize experts
-        if self.config.moe_grouped_gemm:
-            if isinstance(self.submodules.experts, MLPSubmodules):
-                self.experts = TEGroupedMLP(
-                    self.num_local_experts, self.config, self.submodules.experts
-                )
-            else:
-                self.experts = GroupedMLP(self.num_local_experts, self.config)
-        else:
-            assert isinstance(self.submodules.experts, MLPSubmodules)
-            self.experts = SequentialMLP(
-                self.num_local_experts, self.config, self.submodules.experts
-            )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -120,14 +100,21 @@ class MoELayer(BaseMoELayer):
             self.token_dispatcher = MoEAlltoAllSEQTokenDispatcher(
                 self.num_local_experts, self.local_expert_indices, config=self.config
             )
+        elif config.moe_token_dispatcher_type == "flex":
+            self.token_dispatcher = MoEFlexTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
         else:
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
             )
 
+        # Initialize experts
+        self.experts = build_module(self.submodules.experts, self.num_local_experts, self.config)
+
         # Initialize shared experts
         if self.use_shared_expert:
-            self.shared_experts = SharedExpertMLP(self.config, self.submodules.shared_experts)
+            self.shared_experts = build_module(self.submodules.shared_experts, config=self.config)
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
@@ -153,7 +140,7 @@ class MoELayer(BaseMoELayer):
             if self.use_shared_expert and not self.shared_expert_overlap:
                 # if shared_expert_overlap is True, the expert calculation happens in
                 # the token_dispatcher to overlap communications and computations
-                output += self.shared_experts(hidden_states)
+                output = output + self.shared_experts(hidden_states)
             return output, mlp_bias
 
         if self.moe_layer_recompute:

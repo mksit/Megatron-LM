@@ -75,8 +75,8 @@ OPTIONS=" \
     --decoder-seq-length ${DECODER_SEQ_LEN} \
     --max-position-embeddings ${MAX_POS_EMBED} \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model ${WORKSPACE}/<path to tokenizer> \
-    --tokenizer-prompt-format chatml \
+    --tokenizer-model NousResearch/Nous-Hermes-2-Yi-34B \
+    --tokenizer-prompt-format nvlm-yi-34b \
     --vocab-size 64000 \
     --make-vocab-size-divisible-by 1 \
     --position-embedding-type rope \
@@ -101,6 +101,7 @@ OPTIONS=" \
     --init-method-std 0.014 \
     --attention-dropout ${AD} \
     --hidden-dropout ${HD} \
+    --untie-embeddings-and-output-weights \
     --eod-mask-loss \
     --bf16 \
     --tensorboard-dir=${TENSORBOARD_DIR} \
@@ -130,7 +131,7 @@ OPTIONS=" \
     --use-checkpoint-args \
     --ckpt-format torch \
     --pixel-shuffle \
-    --use-image-tag
+    --image-tag-type nvlm
     "
 
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${ALLOW_NONDETERMINISTIC}

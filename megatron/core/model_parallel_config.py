@@ -19,6 +19,11 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
+    pipeline_model_parallel_comm_backend: Optional[str] = None
+    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
+       If None, the default backend will be used.
+    """
+
     pipeline_model_parallel_size: int = 1
     """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
 
@@ -50,11 +55,12 @@ class ModelParallelConfig:
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
+    expert_tensor_parallel_size: Optional[int] = None
+    """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks."""
+
     moe_extended_tp: bool = False
-    """Alternative parallelization strategy for expert parallelism. Instead of distributing experts
-       across expert_model_parallel_size, each expert is sharded along extendended tensor parallel
-       domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing
-       problem with MOE training.
+    """NOTE: Deprecated from MCore v0.10. This flag is ignored.
+      Its functionality is replaced by expert_tensor_parallel_size.
     """
 
     ###################
@@ -211,6 +217,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
+    cross_entropy_fusion_impl: str = 'native'
+    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
+       from Transformer Engine library is used. Defaults to 'native'.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
@@ -340,6 +351,9 @@ class ModelParallelConfig:
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Can not use sequence paralllelism without tensor parallelism")
+
+        if self.expert_tensor_parallel_size is None:
+            self.expert_tensor_parallel_size = self.tensor_model_parallel_size
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:

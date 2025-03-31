@@ -1,13 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
 
-import os
 import torch
 from functools import partial
 from contextlib import nullcontext
 import inspect
 
-from typing import Union
+from typing import List, Optional, Tuple, Union
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
@@ -15,9 +14,9 @@ from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.rerun_state_machine import get_rerun_state_machine
 import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
@@ -26,13 +25,17 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_blend_and_blend_per_split,
 )
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
 
 stimer = StragglerDetector()
@@ -61,6 +64,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             # record stack information for the trace events
             trace_alloc_record_context=True)
 
+        def oom_observer(device, alloc, device_alloc, device_free):
+            # snapshot right after an OOM happened
+            print('saving allocated state during OOM')
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+
     print_rank_0('building GPT model ...')
     # Experimental loading arguments from yaml
     if args.yaml_cfg is not None:
@@ -80,10 +92,23 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
         else:
-            if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm, args.multi_latent_attention, args.fp8)
+            if args.num_experts:
+                # Define the decoder block spec
+                transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te, normalization=args.normalization)
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm, args.multi_latent_attention)
+                # Define the decoder layer spec
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm,
+                        normalization=args.normalization)
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
 
         build_model_context = nullcontext
         build_model_context_args = {}
@@ -114,7 +139,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 position_embedding_type=args.position_embedding_type,
                 rotary_percent=args.rotary_percent,
                 rotary_base=args.rotary_base,
-                rope_scaling=args.use_rope_scaling
+                rope_scaling=args.use_rope_scaling,
+                mtp_block_spec=mtp_block_spec,
             )
 
     return model
@@ -134,6 +160,10 @@ def get_batch(data_iterator):
     batch = get_batch_on_this_cp_rank(batch)
 
     return batch.values()
+
+
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
@@ -160,20 +190,45 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss[0].isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
         )
-
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
+            message="Spiky loss",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=False,
+        )
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
     local_num_tokens = loss[1].clone().detach().to(torch.int)
     return (
-        loss[0] * args.context_parallel_size,
+        loss[0].clone(),
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
@@ -198,8 +253,12 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+        if args.use_legacy_models:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels)
+        else:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels, loss_mask=loss_mask)
 
     return output_tensor, partial(loss_func, loss_mask)
 
@@ -213,16 +272,16 @@ def is_dataset_built_on_rank():
 def core_gpt_dataset_config_from_args(args):
     tokenizer = get_tokenizer()
 
+    # Sometimes --data-path is too long, instead we parse it from a file.
+    blend: Optional[Tuple[List[str], Optional[List[float]]]]
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
     return GPTDatasetConfig(
         random_seed=args.seed,
         sequence_length=args.seq_length,
-        blend=get_blend_from_list(args.data_path),
-        blend_per_split=[
-            get_blend_from_list(args.train_data_path),
-            get_blend_from_list(args.valid_data_path),
-            get_blend_from_list(args.test_data_path)
-        ],
-        renormalize_blend_weights=args.renormalize_blend_weights,
+        blend=blend,
+        blend_per_split=blend_per_split,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
@@ -232,7 +291,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
-        s3_cache_path = args.s3_cache_path
+        s3_cache_path=args.s3_cache_path,
     )
 
 

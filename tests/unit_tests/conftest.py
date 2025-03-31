@@ -1,16 +1,46 @@
-import gc
 import os
-import sys
 from pathlib import Path
-from unittest import mock
 
 import pytest
 import torch
+import torch.distributed
 
-from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
+from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+def pytest_addoption(parser):
+    """
+    Additional command-line arguments passed to pytest.
+    For now:
+        --experimental: Enable the Mcore experimental flag (DEFAULT: False)
+    """
+    parser.addoption(
+        '--experimental',
+        action='store_true',
+        help="pass that argument to enable experimental flag during testing (DEFAULT: False)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def experimental(request):
+    """Simple fixture setting the experimental flag [CPU | GPU]"""
+    config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if exitstatus == 5:
+        session.exitstatus = 0
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup():
+    yield
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 @pytest.fixture(scope="function", autouse=True)

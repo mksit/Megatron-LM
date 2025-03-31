@@ -1,9 +1,16 @@
+import os
+
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
 
-from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
 
 
 class Net(nn.Module):
@@ -64,3 +71,92 @@ def test_chained_optimizer():
 
     assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+
+
+def test_precision_aware_fused_adam():
+    try:
+        from transformer_engine.pytorch.optimizers import FusedAdam
+    except ImportError:
+        # Older versions of TE don't have FusedAdam.
+        return
+
+    import inspect
+
+    adam_args = inspect.signature(FusedAdam).parameters
+    arg_names = ["master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype", "use_decoupled_grad"]
+    for name in arg_names:
+        if name not in adam_args:
+            # Skip the test if TE doesn't support precision aware FusedAdam.
+            return
+
+    tensor = torch.rand(278011, dtype=torch.bfloat16).cuda()
+    params_1 = [torch.nn.Parameter(tensor.float())]  # FP32 reference
+    params_2 = [torch.nn.Parameter(tensor.clone())]  # BF16
+
+    options = {"lr": 1, "betas": (0.1, 0.25), "eps": 1e-08, "weight_decay": 0, "amsgrad": False}
+
+    optimizer_1 = FusedAdam(params_1, **options)
+    optimizer_2 = FusedAdam(params_2, master_weights=True, use_decoupled_grad=True, **options)
+
+    for _ in range(1000):
+        for p_1, p_2 in zip(params_1, params_2):
+            p_1.grad = torch.rand_like(p_1)
+            p_2.decoupled_grad = p_1.grad.clone()
+
+        optimizer_1.step()
+        optimizer_2.step()
+
+        master_params = [optimizer_2.get_unscaled_state(p, "master_param") for p in params_2]
+        for p_1, p_2 in zip(params_1, master_params):
+            bytes_1 = p_1.data.view(torch.uint8)
+            bytes_2 = p_2.data.view(torch.uint8)
+            # Make sure bit-wise matched
+            assert torch.all(bytes_1 == bytes_2)
+
+        for p_1, p_2 in zip(params_1, params_2):
+            bytes_1 = p_1.data.bfloat16().view(torch.uint8)
+            bytes_2 = p_2.data.view(torch.uint8)
+            # Make sure bit-wise matched
+            assert torch.all(bytes_1 == bytes_2)
+
+
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("precision", ['bf16', 'fp32'])
+def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    # Setup: distributed, model, mock_args.
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    for param in model.parameters():
+        assert param.requires_grad
+
+    if precision == 'bf16':
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', bf16=True, use_distributed_optimizer=use_distributed_optimizer
+        )
+    elif precision == 'fp32':
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            bf16=False,
+            fp16=False,
+            use_distributed_optimizer=use_distributed_optimizer,
+        )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    model_sharded_state_dict = model.sharded_state_dict()
+    sharded_state_dict = optim.sharded_state_dict(model_sharded_state_dict)
+
+    if 'optimizer' in sharded_state_dict and 'state' in sharded_state_dict['optimizer']:
+        assert (
+            'common_step' not in sharded_state_dict['optimizer']['state']
+            or sharded_state_dict['optimizer']['state']['common_step'] is not None
+        ), "Found 'optimizer.state.common_step=None' in sharded state dict."

@@ -5,18 +5,22 @@ from typing import List, Literal, Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecate_inference_params
 
 
 class T5LMHead(MegatronModule):
@@ -135,9 +139,13 @@ class T5Model(LanguageModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        position_embedding_type: Literal[
+            'learned_absolute', 'rope', 'relative'
+        ] = 'learned_absolute',
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
+        relative_attention_num_buckets: int = 32,
+        relative_attention_max_distance: int = 128,
         add_encoder: bool = True,
         add_decoder: bool = True,
     ):
@@ -193,6 +201,23 @@ class T5Model(LanguageModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
+        # Relative Position Embeddings
+        if self.position_embedding_type == 'relative':
+            self.encoder_relative_pos_emb = RelativePositionEmbedding(
+                bidirectional=True,
+                init_method=self.config.init_method,
+                num_attention_heads=self.config.num_attention_heads,
+                relative_attention_num_buckets=relative_attention_num_buckets,
+                relative_attention_max_distance=relative_attention_max_distance,
+            )
+            self.decoder_relative_pos_emb = RelativePositionEmbedding(
+                bidirectional=False,
+                init_method=self.config.init_method,
+                num_attention_heads=self.config.num_attention_heads,
+                relative_attention_num_buckets=relative_attention_num_buckets,
+                relative_attention_max_distance=relative_attention_max_distance,
+            )
+
         # Transformer encoder
         encoder_spec, decoder_spec = (
             self.transformer_encoder_layer_spec,
@@ -243,8 +268,10 @@ class T5Model(LanguageModule):
         lm_labels: Tensor = None,
         encoder_hidden_states: Tensor = None,
         output_encoder_hidden_only: bool = False,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -255,11 +282,13 @@ class T5Model(LanguageModule):
             decoder_attn_mask (Tensor): self-attention mask for decoder
             encoder_decoder_attn_mask (Tensor): cross-attention mask between encoder and decoder
             lm_labels (Tensor): labels for decoder output
-            inference_params (InferenceParams): relevant arguments for inferencing
+            inference_context (BaseInferenceContext): relevant arguments for inferencing
 
         Returns:
             Tensor: loss tensor
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ## Encoder forward
         if encoder_hidden_states is None:
@@ -280,17 +309,39 @@ class T5Model(LanguageModule):
             rotary_pos_emb = None
             if self.position_embedding_type == 'rope':
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_params, self.encoder, encoder_input, self.config, packed_seq_params
+                    inference_context, self.encoder, encoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+            # Relative positional embeddings
+            encoder_attention_bias_parallel = None
+            if self.position_embedding_type == 'relative':
+                query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
+                    inference_context, self.encoder, encoder_input, self.config
+                )
+                key_seq_length = query_seq_length
+                attention_bias = self.encoder_relative_pos_emb(query_seq_length, key_seq_length)
+
+                # Scatter attention_bias to TP ranks
+                # First, reshape [1, num_head, seqlen_q, seqlen_kv] to
+                # [1, seqlen_q, seqlen_kv, num_head] to be scatter along
+                # the last (num_heads dimension)
+                attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
+                # Then, scatter to TP region
+                attention_bias_parallel = scatter_to_tensor_model_parallel_region(attention_bias)
+                # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
+                encoder_attention_bias_parallel = torch.permute(
+                    attention_bias_parallel, (0, 3, 1, 2)
+                )
 
             # Run encoder.
             if self.add_encoder:
                 encoder_hidden_states = self.encoder(
                     hidden_states=encoder_input,
                     attention_mask=encoder_attn_mask,
-                    inference_params=inference_params,
+                    inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=encoder_attention_bias_parallel,
                 )
             else:
                 encoder_hidden_states = self.encoder_hidden_state
@@ -315,9 +366,28 @@ class T5Model(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.encoder, encoder_input, self.config, packed_seq_params
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        # Relative positional embeddings
+        decoder_attention_bias_parallel = None
+        if self.position_embedding_type == 'relative':
+            query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
+                inference_context, self.decoder, decoder_input, self.config
+            )
+            key_seq_length = query_seq_length
+            attention_bias = self.decoder_relative_pos_emb(query_seq_length, key_seq_length)
+
+            # Scatter attention_bias to TP ranks
+            # First, reshape [1, num_head, seqlen_q, seqlen_kv] to
+            # [1, seqlen_q, seqlen_kv, num_head] to be scatter along
+            # the last (num_heads dimension)
+            attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
+            # Then, scatter to TP region
+            attention_bias_parallel = scatter_to_tensor_model_parallel_region(attention_bias)
+            # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
+            decoder_attention_bias_parallel = torch.permute(attention_bias_parallel, (0, 3, 1, 2))
 
         # Run decoder.
         decoder_hidden_states = self.decoder(
@@ -325,14 +395,17 @@ class T5Model(LanguageModule):
             attention_mask=decoder_attn_mask,
             context=encoder_hidden_states,
             context_mask=encoder_decoder_attn_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            attention_bias=decoder_attention_bias_parallel,
         )
 
         if self.post_process:
-            lm_logits = self.lm_head(
-                decoder_hidden_states, self.shared_embedding_or_output_weight()
-            )
+            output_weight = None
+            if self.share_embeddings_and_output_weights:
+                output_weight = self.shared_embedding_or_output_weight()
+            lm_logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
+
             if lm_labels is None:
                 # [s b h] => [b s h]
                 return lm_logits.transpose(0, 1).contiguous()
