@@ -281,6 +281,8 @@ def is_torch_min_version(version, check_equality=True):
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
+    if isinstance(numerator, (torch.SymInt, torch.SymFloat)) or isinstance(denominator, (torch.SymInt, torch.SymFloat)):
+        return True
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
 
 
