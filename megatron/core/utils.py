@@ -304,6 +304,28 @@ def deprecate_inference_params(inference_context, inference_params):
     return inference_context
 
 
+def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
+    """Issue a deprecation warning if tp_group is None and return the default tp group."""
+    # TODO(zijiey): remove this function later.
+    if tp_group is None:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            warnings.warn(
+                "Warning: tp_group is None, using default tp group. "
+                "Passing tp_group will be mandatory soon",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if is_expert:
+            tp_group = parallel_state.get_expert_tensor_parallel_group(
+                check_initialized=check_initialized
+            )
+        else:
+            tp_group = parallel_state.get_tensor_model_parallel_group(
+                check_initialized=check_initialized
+            )
+    return tp_group
+
+
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
     """Get an attribute from a wrapped model.
     If return_model_obj is true, return the object that has the 'attr' attribute;
@@ -386,6 +408,26 @@ def _kernel_make_viewless_tensor(inp, requires_grad):
     out = torch.empty((1,), dtype=inp.dtype, device=inp.device, requires_grad=requires_grad)
     out.data = inp.data
     return out
+
+
+class WrappedTensor:
+    """
+    A wrapper for tensors that enables caller functions to pass an indirect reference
+    to callee functions. By wrapping the tensor, the caller's direct reference is removed,
+    allowing the tensor to be garbage collected once the callee unwraps and frees it.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        self._wrapper = [tensor]
+
+    def unwrap(self):
+        """
+        Returns the wrapped tensor while deleting the internal reference.
+        Can only be called once.
+        """
+        if len(self._wrapper) == 0:
+            raise RuntimeError(f"WrappedTensor has already been unwrapped")
+        return self._wrapper.pop(0)
 
 
 class MakeViewlessTensor(torch.autograd.Function):
