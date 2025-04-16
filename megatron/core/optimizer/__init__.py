@@ -43,16 +43,6 @@ from .optimizer_config import OptimizerConfig
 logger = logging.getLogger(__name__)
 
 
-COMPACTRON_INSTALLED = False
-
-try:
-    import compactron
-    COMPACTRON_INSTALLED = True
-except ImportError:
-    COMPACTRON_INSTALLED = False
-    pass
-
-
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     no_weight_decay_cond: Optional[Callable],
@@ -414,14 +404,6 @@ def _get_megatron_optimizer_based_on_param_groups(
                     growth_interval=config.loss_scale_window,
                     hysteresis=config.hysteresis,
                 )
-
-        # Compactron: Hybrid CPU-GPU optimizer
-        if COMPACTRON_INSTALLED:
-            if compactron.get_config().use_hybrid_optimizer:
-                from compactron.optimizer import HybridOptimizer
-                optimizer = HybridOptimizer(optimizer, config, grad_scaler, init_state_fn)
-                setattr(optimizer, 'model_parallel_group', model_parallel_group)
-                return optimizer
 
         optimizer_args = [optimizer, config, grad_scaler, init_state_fn]
         if config.use_distributed_optimizer:
