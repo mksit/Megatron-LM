@@ -216,8 +216,8 @@ class CudaRNGStatesTracker:
             yield
         finally:
             # Throw a warning if cpu RNG state changed
-            # if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
-            #     logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
+            if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
+                logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
             # Update the current rng state for later use.
             self.states_[name] = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
             # And set the state to the original state we started with.

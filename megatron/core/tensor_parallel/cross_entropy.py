@@ -145,10 +145,6 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             )
         )
 
-        # TODO(mksit): A graph break is required here; otherwise, torch.compile+AOTAutograd fails to compile
-        # this function on Pytorch >2.5.0, but I don't understand the root cause of this issue yet.
-        torch._dynamo.graph_break()
-
         # All reduce is needed to get the chunks from other GPUs.
         torch.distributed.all_reduce(
             predicted_logits,

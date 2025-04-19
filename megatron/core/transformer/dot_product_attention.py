@@ -142,12 +142,8 @@ class DotProductAttention(MegatronModule):
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        # matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-        #     (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
-        # )
-        # The use of global memory buffer triggers recompilation.
-        matmul_input_buffer = torch.empty(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), dtype=query.dtype, device=query.device
+        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
         )
 
         # Raw attention scores. [b * np, sq, sk]
